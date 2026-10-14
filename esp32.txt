@@ -1,0 +1,383 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include <esp_system.h>
+
+// ============================ 0. 配置区（只改这里）=========================
+#define NAME_PREFIX        "ESP32_LED"   // 广播名前缀，最终名 = 前缀_MAC后4位
+#define PIN_LED            2             // LED 所在引脚（板上丝印 D2 通常就是 GPIO2）
+#define LED_ACTIVE_LOW     0             // 0 = 高电平点亮；1 = 低电平点亮
+#define LED_SELF_TEST      1             // 1 = 上电闪 3 次自检（正式演示可改 0）
+#define PIN_SENSOR         4             // DS18B20 / DHT11 数据线
+#define DHT_TYPE           DHT11
+#define NOTIFY_PERIOD_MS   2000UL        // 推送周期
+#define REQUEST_MTU        185           // 请求 MTU；单包有效载荷上限 = MTU-3
+#define ALLOW_FAKE_DATA    1             // 1 = 读不到传感器时用模拟值
+
+#define UUID_SERVICE       "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define UUID_CHAR_LED      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define UUID_CHAR_JSON     "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"
+#define UUID_CHAR_ID       "6E400005-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ============================ 1. 全局对象 ==================================
+BLEServer         *g_server   = nullptr;
+BLECharacteristic *g_chLed    = nullptr;
+BLECharacteristic *g_chJson   = nullptr;
+BLECharacteristic *g_chId     = nullptr;
+BLE2902           *g_cccdLed  = nullptr;
+BLE2902           *g_cccdJson = nullptr;
+
+OneWire           g_ow(PIN_SENSOR);
+DallasTemperature g_ds(&g_ow);
+DHT               g_dht(PIN_SENSOR, DHT_TYPE);
+
+enum SensorKind { SENSOR_NONE = 0, SENSOR_DS18B20, SENSOR_DHT11 };
+static SensorKind g_kind = SENSOR_NONE;
+static const char *KIND_NAME[3] = {"无", "DS18B20", "DHT11"};
+
+static char     g_name[28];              // 最终广播名
+static char     g_tag[5] = "----";       // 身份码（MAC 后 4 位）
+
+static bool     g_connected = false;
+static bool     g_ledOn     = false;
+static uint32_t g_seq       = 0;
+static uint32_t g_tNotify   = 0;
+static uint32_t g_ledWrites = 0;         // 收到过多少次 LED 写入（排查用）
+
+static inline bool ledSubscribed()  { return g_cccdLed  && g_cccdLed->getNotifications();  }
+static inline bool jsonSubscribed() { return g_cccdJson && g_cccdJson->getNotifications(); }
+
+// ============================ 2. 身份码 ====================================
+static void buildIdentity() {
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_BT);
+  snprintf(g_tag,  sizeof(g_tag),  "%02X%02X", mac[4], mac[5]);
+  snprintf(g_name, sizeof(g_name), "%s_%s", NAME_PREFIX, g_tag);
+}
+
+// ============================ 3. LED =======================================
+static void ledApply(bool on) {
+  g_ledOn = on;
+#if LED_ACTIVE_LOW
+  digitalWrite(PIN_LED, on ? LOW : HIGH);
+#else
+  digitalWrite(PIN_LED, on ? HIGH : LOW);
+#endif
+}
+
+// 上电自检：闪 3 次。看得到 = 引脚与极性正确
+static void ledSelfTest() {
+#if LED_SELF_TEST
+  Serial.printf("[自检] LED 引脚 GPIO%d（%s有效）闪烁 3 次，请盯着板上的 LED…\n",
+                PIN_LED, LED_ACTIVE_LOW ? "低" : "高");
+  for (uint8_t i = 0; i < 3; i++) {
+    ledApply(true);   delay(250);
+    ledApply(false);  delay(250);
+  }
+  ledApply(false);
+  Serial.println(F("[自检] 看到了 → 引脚和极性正确；没看到 → 改 PIN_LED 或 LED_ACTIVE_LOW"));
+#else
+  ledApply(false);
+#endif
+}
+
+// ============================ 4. 传感器 ====================================
+// DS18B20 会在总线上应答"存在脉冲"，DHT11 不会，用这个差别自动识别。
+static void detectSensor() {
+  g_ds.begin();
+  if (g_ds.getDeviceCount() > 0) {
+    g_ds.setResolution(12);
+    g_kind = SENSOR_DS18B20;
+    DeviceAddress a;
+    if (g_ds.getAddress(a, 0)) {
+      Serial.print(F("[传感器] DS18B20 ROM = "));
+      for (uint8_t i = 0; i < 8; i++) Serial.printf("%02X ", a[i]);
+      Serial.println();
+    }
+  } else {
+    g_dht.begin();
+    g_kind = SENSOR_DHT11;
+  }
+  Serial.printf("[传感器] 识别结果: %s\n", KIND_NAME[g_kind]);
+}
+
+static bool readSensor(float &t, float &h) {
+  if (g_kind == SENSOR_DS18B20) {
+    g_ds.requestTemperatures();
+    float v = g_ds.getTempCByIndex(0);
+    if (v == DEVICE_DISCONNECTED_C || v < -55.0f || v > 125.0f) return false;
+    t = v; h = NAN;                     // DS18B20 只测温度，湿度用 NaN 表示"没有"
+    return true;
+  }
+  if (g_kind == SENSOR_DHT11) {
+    float hh = g_dht.readHumidity();
+    float tt = g_dht.readTemperature();
+    if (isnan(hh) || isnan(tt)) return false;
+    t = tt; h = hh;
+    return true;
+  }
+  return false;
+}
+
+// ============================ 5. JSON ======================================
+// 字段：seq 序号 / t 温度 / h 湿度(null=无) / led 灯状态 / ok 数据是否真实
+static size_t buildJson(char *out, size_t n, uint32_t seq,
+                        float t, float h, bool led, bool real) {
+  if (isnan(h))
+    return snprintf(out, n, "{\"seq\":%lu,\"t\":%.2f,\"h\":null,\"led\":%d,\"ok\":%d}",
+                    (unsigned long)seq, t, led ? 1 : 0, real ? 1 : 0);
+  return snprintf(out, n, "{\"seq\":%lu,\"t\":%.2f,\"h\":%.1f,\"led\":%d,\"ok\":%d}",
+                  (unsigned long)seq, t, h, led ? 1 : 0, real ? 1 : 0);
+}
+
+// 解析手机下发的简单 JSON（认 "led":0/1、以及 "cmd":"toggle"/"on"/"off"）
+static int parseLedCommand(const std::string &s, bool &handled) {
+  handled = false;
+  if (s.find("\"led\"") != std::string::npos) {
+    size_t p = s.find("\"led\"");
+    p = s.find(':', p);
+    if (p != std::string::npos) {
+      for (size_t i = p + 1; i < s.size(); i++) {
+        if (s[i] == '1') { handled = true; return 1; }
+        if (s[i] == '0') { handled = true; return 0; }
+      }
+    }
+  }
+  if (s.find("\"cmd\"") != std::string::npos) {
+    if (s.find("toggle") != std::string::npos) { handled = true; return g_ledOn ? 0 : 1; }
+    if (s.find("\"on\"")   != std::string::npos) { handled = true; return 1; }
+    if (s.find("\"off\"")  != std::string::npos) { handled = true; return 0; }
+  }
+  return -1;
+}
+
+// ============================ 6. 回调 ======================================
+class LedCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    std::string rx = ch->getValue();
+    if (rx.empty()) return;
+    g_ledWrites++;
+
+    // 先把原始字节打出来：排查"发了没反应"时，看这里收到的到底是什么
+    Serial.printf("[WRITE] 第%lu次  长度=%u  字节: ", (unsigned long)g_ledWrites,
+                  (unsigned)rx.length());
+    for (size_t i = 0; i < rx.length(); i++) {
+      char c = rx[i];
+      Serial.printf("%02X(%c) ", (uint8_t)c, (c >= 32 && c < 127) ? c : '.');
+    }
+    Serial.println();
+
+    // 【兼容】nRF Connect 无格式下拉框时，输入 1 会发成"单字节 0x01"而非字符 '1'
+    if (rx.size() == 1 && (rx[0] == 0x01 || rx[0] == 0x00)) {
+      bool on = (rx[0] == 0x01);
+      ledApply(on);
+      Serial.printf("[LED] 收到字节 0x%02X -> GPIO%d = %s\n",
+                    (uint8_t)rx[0], PIN_LED, on ? "亮" : "灭");
+      g_chLed->setValue(on ? "1" : "0");
+      if (g_connected && ledSubscribed()) g_chLed->notify();
+      return;
+    }
+
+    // 去掉首尾空白/回车/换行（手机 App 常自动补 \r\n）
+    std::string s = rx;
+    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t e = s.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos) { Serial.println(F("[WRITE] 全是空白，忽略")); return; }
+    s = s.substr(b, e - b + 1);
+
+    bool handled = false;
+    int  want    = parseLedCommand(s, handled);
+    if (!handled) {
+      if      (s == "1" || s == "ON"  || s == "on"  || s == "true")  want = 1;
+      else if (s == "0" || s == "OFF" || s == "off" || s == "false") want = 0;
+      else if (s == "toggle")                                        want = g_ledOn ? 0 : 1;
+      else {
+        Serial.printf("[WRITE] 无法识别 \"%s\"（认 1/0/ON/OFF/toggle 或 {\"led\":1}）\n", s.c_str());
+        return;
+      }
+      handled = true;
+    }
+
+    ledApply(want == 1);
+    Serial.printf("[LED] GPIO%d -> %s\n", PIN_LED, g_ledOn ? "亮" : "灭");
+
+    g_chLed->setValue(g_ledOn ? "1" : "0");
+    if (g_connected && ledSubscribed()) g_chLed->notify();
+  }
+};
+
+class IdCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    std::string v = ch->getValue();
+    Serial.printf("[身份] 手机写入 \"%s\"，回送身份码 %s\n", v.c_str(), g_tag);
+    ch->setValue(g_tag);
+  }
+  void onRead(BLECharacteristic *ch) override {
+    Serial.printf("[身份] 手机读取身份码 %s\n", g_tag);
+  }
+};
+
+class ServerCallbacks : public BLEServerCallbacks {
+  // 内核 2.0.4 的签名带 param；3.x 内核请改成 onConnect(BLEServer *s)
+  void onConnect(BLEServer *s, esp_ble_gatts_cb_param_t *param) override {
+    g_connected = true;
+    Serial.printf("[BLE] 手机已连接  手机地址 = %02X:%02X:%02X:%02X:%02X:%02X（本机身份码 %s）\n",
+                  param->connect.remote_bda[0], param->connect.remote_bda[1],
+                  param->connect.remote_bda[2], param->connect.remote_bda[3],
+                  param->connect.remote_bda[4], param->connect.remote_bda[5], g_tag);
+    Serial.println(F("[BLE] 提醒：还要点 6E400004 右侧三个向下箭头订阅，才会收到每秒推送"));
+  }
+  void onDisconnect(BLEServer *s) override {
+    g_connected = false;
+    Serial.println(F("[BLE] 手机已断开（订阅随之失效）-> 0.5 秒后重新广播"));
+    delay(500);
+    BLEDevice::startAdvertising();
+  }
+  void onMtuChanged(BLEServer *s, esp_ble_gatts_cb_param_t *p) override {
+    Serial.printf("[BLE] MTU 协商完成 = %d\n", p->mtu.mtu);
+  }
+};
+
+// ============================ 7. setup =====================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PIN_LED, OUTPUT);
+  ledApply(false);
+  buildIdentity();
+
+  // 打印本次复位原因：能立刻分辨"是欠压重启"还是"正常上电"
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char *rrName = "未知";
+  switch (rr) {
+    case ESP_RST_POWERON:   rrName = "正常上电";          break;
+    case ESP_RST_SW:        rrName = "软件复位";          break;
+    case ESP_RST_PANIC:     rrName = "程序崩溃(PANIC)";   break;
+    case ESP_RST_INT_WDT:   rrName = "中断看门狗";        break;
+    case ESP_RST_TASK_WDT:  rrName = "任务看门狗";        break;
+    case ESP_RST_WDT:       rrName = "看门狗";            break;
+    case ESP_RST_BROWNOUT:  rrName = "欠压复位(BROWNOUT)"; break;
+    case ESP_RST_DEEPSLEEP: rrName = "深睡唤醒";          break;
+    case ESP_RST_EXT:       rrName = "外部复位";          break;
+    default: break;
+  }
+
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_BT);
+  Serial.println();
+  Serial.println(F("=============================================="));
+  Serial.println(F(" 实验九  BLE 控制 LED + 传感器 Notify(JSON)"));
+  Serial.println(F("=============================================="));
+  Serial.printf ("[复位] 原因 = %s\n", rrName);
+  if (rr == ESP_RST_BROWNOUT)
+    Serial.println(F("[复位] !! 欠压：换主机后面板 USB 口 + 粗短数据线，VCC-GND 并 100µF"));
+  Serial.printf ("[身份] 蓝牙 MAC = %02X:%02X:%02X:%02X:%02X:%02X\n",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.printf ("[身份] 身份码 = %s   →  手机端应显示 ESP32_LED_%s\n", g_tag, g_tag);
+  Serial.printf ("[配置] LED = GPIO%d（%s有效） | 传感器 = GPIO%d | 周期 = %lu ms\n",
+                 PIN_LED, LED_ACTIVE_LOW ? "低" : "高", PIN_SENSOR, NOTIFY_PERIOD_MS);
+
+  ledSelfTest();          // ★ 上电闪 3 次：看得到说明灯和引脚都对
+
+  detectSensor();
+#if ALLOW_FAKE_DATA
+  Serial.println(F("[传感器] 读不到真实数据时用模拟值（JSON 里 ok=0 可区分）"));
+#endif
+
+  // ---- BLE 骨架：init → server → service → characteristic → start ----
+  BLEDevice::init(g_name);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR < 3
+  BLEDevice::setMTU(REQUEST_MTU);
+#endif
+  BLEDevice::setPower(ESP_PWR_LVL_P3);   // 降低发射功率，削掉电流峰值，减少欠压复位
+
+  g_server = BLEDevice::createServer();
+  g_server->setCallbacks(new ServerCallbacks());
+
+  BLEService *service = g_server->createService(UUID_SERVICE);
+
+  // (a) LED 控制特征值
+  g_chLed = service->createCharacteristic(
+                UUID_CHAR_LED,
+                BLECharacteristic::PROPERTY_READ  |
+                BLECharacteristic::PROPERTY_WRITE |
+                BLECharacteristic::PROPERTY_NOTIFY);
+  g_chLed->setCallbacks(new LedCallbacks());
+  g_chLed->setValue("0");
+  g_cccdLed = new BLE2902();             // ★ Notify 必须有 CCCD，漏了手机订阅不到
+  g_chLed->addDescriptor(g_cccdLed);
+
+  // (b) 传感器 JSON 特征值
+  g_chJson = service->createCharacteristic(
+                 UUID_CHAR_JSON,
+                 BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  g_chJson->setValue("{}");
+  g_cccdJson = new BLE2902();            // 每个 Notify 特征值各一份 CCCD
+  g_chJson->addDescriptor(g_cccdJson);
+
+  // (c) 身份码特征值
+  g_chId = service->createCharacteristic(
+               UUID_CHAR_ID,
+               BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  g_chId->setCallbacks(new IdCallbacks());
+  g_chId->setValue(g_tag);
+
+  service->start();
+
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(service->getUUID());
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06);            // 兼容 iOS 的连接间隔建议值
+  adv->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println(F("[BLE] 开始广播，等待手机连接"));
+  Serial.printf ("[BLE] LED  %s\n", UUID_CHAR_LED);
+  Serial.printf ("[BLE] JSON %s  ← 订阅这个收数据\n", UUID_CHAR_JSON);
+  Serial.printf ("[BLE] 身份 %s\n", UUID_CHAR_ID);
+}
+
+// ============================ 8. loop ======================================
+void loop() {
+  // 订阅状态变化各打印一行：手机到底订上没有，看这里一眼就知道
+  static bool ledPrev = false, jsonPrev = false;
+  if (ledSubscribed() != ledPrev) {
+    ledPrev = ledSubscribed();
+    Serial.printf("[订阅] LED 特征值 %s\n", ledPrev ? "已订阅 OK" : "取消订阅");
+  }
+  if (jsonSubscribed() != jsonPrev) {
+    jsonPrev = jsonSubscribed();
+    Serial.printf("[订阅] JSON 特征值 %s\n", jsonPrev ? "已订阅 OK（开始推送）" : "取消订阅");
+  }
+
+  if (millis() - g_tNotify < NOTIFY_PERIOD_MS) { delay(10); return; }
+  g_tNotify = millis();
+
+  float t = NAN, h = NAN;
+  bool  real = readSensor(t, h);
+  if (!real) {
+#if ALLOW_FAKE_DATA
+    t = 24.0f + 2.5f * sinf(millis() / 7000.0f);
+    h = 55.0f + 8.0f  * cosf(millis() / 9000.0f);
+#else
+    Serial.println(F("[传感器] 读取失败，本次不推送"));
+    return;
+#endif
+  }
+
+  char json[96];
+  size_t len = buildJson(json, sizeof(json), ++g_seq, t, h, g_ledOn, real);
+
+  g_chJson->setValue((uint8_t *)json, len);
+  if (g_connected && jsonSubscribed()) g_chJson->notify();
+
+  Serial.printf("[%s] %-44s %2u字节  LED=%s  订阅(LED=%d,JSON=%d)  连接=%d\n",
+                real ? "实测" : "模拟", json, (unsigned)len,
+                g_ledOn ? "亮" : "灭", ledSubscribed(), jsonSubscribed(), g_connected);
+}
